@@ -441,8 +441,8 @@ impl<'a, 'mir, 'tcx> EvalContextExt<'tcx> for MiriEvalContext<'a, 'mir, 'tcx> {
             usage, ptr, place.layout.ty, new_bor);
 
         // Update the stacks.  First create the new ref as usual, then maybe freeze stuff.
-        self.memory().check_bounds(ptr, size, false)?;
         let alloc = self.memory().get(ptr.alloc_id).expect("We checked that the ptr is fine!");
+        alloc.check_bounds(self, ptr, size, false)?;
         alloc.extra.use_and_maybe_re_borrow(ptr, size, usage, Some(new_bor))?;
         // Maybe freeze stuff
         if let Borrow::Shr(Some(bor_t)) = new_bor {
@@ -506,8 +506,8 @@ impl<'a, 'mir, 'tcx> EvalContextExt<'tcx> for MiriEvalContext<'a, 'mir, 'tcx> {
         }
 
         // If we got here, we do some checking, *but* we leave the tag unchanged.
-        self.memory().check_bounds(ptr, size, false)?;
         let alloc = self.memory().get(ptr.alloc_id).expect("We checked that the ptr is fine!");
+        alloc.check_bounds(self, ptr, size, false)?;
         alloc.extra.check_deref(ptr, size)?;
         // Maybe check frozen stuff
         if let Borrow::Shr(Some(bor_t)) = ptr.tag {

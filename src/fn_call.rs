@@ -114,6 +114,8 @@ impl<'a, 'mir, 'tcx: 'mir + 'a> EvalContextExt<'tcx, 'mir> for super::MiriEvalCo
             None => self.tcx.item_name(def_id).as_str(),
         };
 
+        let tcx = &{self.tcx.tcx};
+
         // All these functions take raw pointers, so if we access memory directly
         // (as opposed to through a place), we have to remember to erase any tag
         // that might still hang around!
@@ -175,7 +177,9 @@ impl<'a, 'mir, 'tcx: 'mir + 'a> EvalContextExt<'tcx, 'mir> for super::MiriEvalCo
                         MiriMemoryKind::Rust.into()
                     )?
                     .with_default_tag();
-                self.memory_mut().write_repeat(ptr.into(), 0, Size::from_bytes(size))?;
+                self.memory_mut()
+                    .get_mut(ptr.alloc_id)?
+                    .write_repeat(tcx, ptr, 0, Size::from_bytes(size))?;
                 self.write_scalar(Scalar::Ptr(ptr), dest)?;
             }
             "__rust_dealloc" => {
@@ -239,7 +243,7 @@ impl<'a, 'mir, 'tcx: 'mir + 'a> EvalContextExt<'tcx, 'mir> for super::MiriEvalCo
             "dlsym" => {
                 let _handle = self.read_scalar(args[0])?;
                 let symbol = self.read_scalar(args[1])?.to_ptr()?.erase_tag();
-                let symbol_name = self.memory().read_c_str(symbol.with_default_tag())?;
+                let symbol_name = self.memory().get(symbol.alloc_id)?.read_c_str(tcx, symbol.with_default_tag())?;
                 let err = format!("bad c unicode symbol: {:?}", symbol_name);
                 let symbol_name = ::std::str::from_utf8(symbol_name).unwrap_or(&err);
                 return err!(Unimplemented(format!(
@@ -348,7 +352,7 @@ impl<'a, 'mir, 'tcx: 'mir + 'a> EvalContextExt<'tcx, 'mir> for super::MiriEvalCo
             "getenv" => {
                 let result = {
                     let name_ptr = self.read_scalar(args[0])?.to_ptr()?.erase_tag(); // raw ptr operation
-                    let name = self.memory().read_c_str(name_ptr.with_default_tag())?;
+                    let name = self.memory().get(name_ptr.alloc_id)?.read_c_str(tcx, name_ptr.with_default_tag())?;
                     match self.machine.env_vars.get(name) {
                         Some(&var) => Scalar::Ptr(var),
                         None => Scalar::ptr_null(&*self.tcx),
@@ -362,7 +366,8 @@ impl<'a, 'mir, 'tcx: 'mir + 'a> EvalContextExt<'tcx, 'mir> for super::MiriEvalCo
                 {
                     let name_ptr = self.read_scalar(args[0])?.not_undef()?.erase_tag(); // raw ptr operation
                     if !name_ptr.is_null_ptr(self) {
-                        let name = self.memory().read_c_str(name_ptr.to_ptr()?
+                        let name_ptr = name_ptr.to_ptr()?;
+                        let name = self.memory().get(name_ptr.alloc_id)?.read_c_str(tcx, name_ptr
                             .with_default_tag())?.to_owned();
                         if !name.is_empty() && !name.contains(&b'=') {
                             success = Some(self.machine.env_vars.remove(&name));
@@ -384,9 +389,10 @@ impl<'a, 'mir, 'tcx: 'mir + 'a> EvalContextExt<'tcx, 'mir> for super::MiriEvalCo
                 {
                     let name_ptr = self.read_scalar(args[0])?.not_undef()?.erase_tag(); // raw ptr operation
                     let value_ptr = self.read_scalar(args[1])?.to_ptr()?.erase_tag(); // raw ptr operation
-                    let value = self.memory().read_c_str(value_ptr.with_default_tag())?;
+                    let value = self.memory().get(value_ptr.alloc_id)?.read_c_str(tcx, value_ptr.with_default_tag())?;
                     if !name_ptr.is_null_ptr(self) {
-                        let name = self.memory().read_c_str(name_ptr.to_ptr()?.with_default_tag())?;
+                        let name_ptr = name_ptr.to_ptr()?;
+                        let name = self.memory().get(name_ptr.alloc_id)?.read_c_str(tcx, name_ptr.with_default_tag())?;
                         if !name.is_empty() && !name.contains(&b'=') {
                             new = Some((name.to_owned(), value.to_owned()));
                         }
@@ -399,9 +405,12 @@ impl<'a, 'mir, 'tcx: 'mir + 'a> EvalContextExt<'tcx, 'mir> for super::MiriEvalCo
                         Align::from_bytes(1, 1).unwrap(),
                         MiriMemoryKind::Env.into(),
                     )?.with_default_tag();
-                    self.memory_mut().write_bytes(value_copy.into(), &value)?;
-                    let trailing_zero_ptr = value_copy.offset(Size::from_bytes(value.len() as u64), self)?.into();
-                    self.memory_mut().write_bytes(trailing_zero_ptr, &[0])?;
+                    {
+                        let alloc = self.memory_mut().get_mut(value_copy.alloc_id)?;
+                        alloc.write_bytes(tcx, value_copy, &value)?;
+                        let trailing_zero_ptr = value_copy.offset(Size::from_bytes(value.len() as u64), tcx)?;
+                        alloc.write_bytes(tcx, trailing_zero_ptr, &[0])?;
+                    }
                     if let Some(var) = self.machine.env_vars.insert(
                         name.to_owned(),
                         value_copy,
@@ -446,7 +455,7 @@ impl<'a, 'mir, 'tcx: 'mir + 'a> EvalContextExt<'tcx, 'mir> for super::MiriEvalCo
 
             "strlen" => {
                 let ptr = self.read_scalar(args[0])?.to_ptr()?.erase_tag();
-                let n = self.memory().read_c_str(ptr.with_default_tag())?.len();
+                let n = self.memory().get(ptr.alloc_id)?.read_c_str(tcx, ptr.with_default_tag())?.len();
                 self.write_scalar(Scalar::from_uint(n as u64, dest.layout.size), dest)?;
             }
 
@@ -510,11 +519,12 @@ impl<'a, 'mir, 'tcx: 'mir + 'a> EvalContextExt<'tcx, 'mir> for super::MiriEvalCo
                 let key_layout = self.layout_of(key_type)?;
 
                 // Create key and write it into the memory where key_ptr wants it
-                let key = self.machine.tls.create_tls_key(dtor, &*self.tcx) as u128;
+                let key = self.machine.tls.create_tls_key(dtor, tcx) as u128;
                 if key_layout.size.bits() < 128 && key >= (1u128 << key_layout.size.bits() as u128) {
                     return err!(OutOfTls);
                 }
-                self.memory_mut().write_scalar(
+                self.memory_mut().get_mut(key_ptr.alloc_id)?.write_scalar(
+                    tcx,
                     key_ptr.with_default_tag(),
                     key_layout.align,
                     Scalar::from_uint(key, key_layout.size).into(),
@@ -613,7 +623,7 @@ impl<'a, 'mir, 'tcx: 'mir + 'a> EvalContextExt<'tcx, 'mir> for super::MiriEvalCo
                 // This just creates a key; Windows does not natively support TLS dtors.
 
                 // Create key and return it
-                let key = self.machine.tls.create_tls_key(None, &*self.tcx) as u128;
+                let key = self.machine.tls.create_tls_key(None, tcx) as u128;
 
                 // Figure out how large a TLS key actually is. This is c::DWORD.
                 if dest.layout.size.bits() < 128 && key >= (1u128 << dest.layout.size.bits() as u128) {
